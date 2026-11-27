@@ -1552,16 +1552,95 @@ struct InkCudaModel {
             INK_CK(cudaSetDevice(primary_gpu));
         }
         uint8_t* h_arena_base = nullptr;
-        if (uh > 0) {
-            const size_t ram_cap = safe_host_ram_cap(ram_experts_gb, ssd_experts);
-            if (ram_cap < uh && !is_strata_fmt) {
-                std::fprintf(stderr, "[InkCUDA] Note: GGUF/HF host spill %.2f GiB exceeds soft RAM cap %.2f GiB (allocating pageable host arena)\n",
-                             (double)uh / 1073741824.0, (double)ram_cap / 1073741824.0);
+        if (n_host_experts > 0) {
+            if (uh > 0) {
+                h_arena_base = hybrid.alloc_host_arena(uh);
+                if (!h_arena_base) { err = "cannot allocate bounded host expert arena"; return false; }
             }
-            h_arena_base = hybrid.alloc_host_arena(uh);
-            if (!h_arena_base) { err = "cannot allocate host expert arena"; return false; }
             hybrid.host_meta.assign((size_t)man.c.n_phys * man.c.n_experts, {});
             hybrid.orig_host_off.assign((size_t)man.c.n_phys * man.c.n_experts, 0);
+        }
+
+        // External GGUF/HF cold experts are reconstructed into one bounded ring slot on demand.
+        // The synthetic source span preserves the exact adapter conversion path (including exotic GGUF -> SF4).
+        if (n_ssd_experts > 0) {
+            const size_t virtual_stride = (max_exp_b + 4095ull) & ~4095ull;
+            if (virtual_stride == 0 || n_total > (int)(UINT64_MAX / virtual_stride)) {
+                err = "GGUF cold tier: invalid virtual source layout";
+                return false;
+            }
+            std::vector<ink2::InkColdExpertDesc> cdescs((size_t)n_total);
+            for (int di = 0; di < n_total; ++di) {
+                if (!in_cold[di]) continue;
+                auto& d = cdescs[(size_t)di];
+                d.file_off = (uint64_t)di * virtual_stride;
+                d.body_bytes = (uint32_t)eff_bytes[(size_t)di];
+                d.dn_off = need_sf4_repack[(size_t)di] ? (uint32_t)sf4_dn_off_const : dir[(size_t)di].dn_offset;
+                d.gu_code = need_sf4_repack[(size_t)di] ? FMT_SF4 : dir[(size_t)di].gu_code_id;
+                d.dn_code = need_sf4_repack[(size_t)di] ? FMT_SF4 : dir[(size_t)di].dn_code_id;
+                d.n_spans = 1;
+                d.spans[0] = {-1, d.file_off, 0, d.body_bytes};
+            }
+
+            const auto* mf_ptr = &mf;
+            const auto* dir_ptr = &dir;
+            const auto need_repack_copy = need_sf4_repack;
+            const auto eff_bytes_copy = eff_bytes;
+            const auto dequant_copy = dequant_row;
+            const auto row_bytes_copy = row_bytes;
+            ink2::InkColdStore::ReaderFn source_reader =
+                [mf_ptr, dir_ptr, need_repack_copy, eff_bytes_copy, dequant_copy, row_bytes_copy,
+                 D, F, sf4_dn_off_const, virtual_stride, n_total](int file_idx, uint64_t file_off,
+                                                                  uint8_t* dst, size_t len) -> bool {
+                    if (file_idx != -1 || virtual_stride == 0 || (file_off % virtual_stride) != 0) return false;
+                    const uint64_t key64 = file_off / virtual_stride;
+                    if (key64 >= (uint64_t)n_total) return false;
+                    const int di = (int)key64;
+                    if (len != eff_bytes_copy[(size_t)di]) return false;
+                    std::vector<uint8_t> raw;
+                    std::string read_err;
+                    if (!mf_ptr->read_expert_body((size_t)di, raw, read_err)) {
+                        std::fprintf(stderr, "[InkCUDA] GGUF cold read expert %d failed: %s\n", di, read_err.c_str());
+                        return false;
+                    }
+                    std::memset(dst, 0, len);
+                    if (need_repack_copy[(size_t)di]) {
+                        std::vector<uint8_t> packed;
+                        uint32_t new_dn = 0;
+                        if (!repack_gguf_raw_body_to_sf4(raw.data(), dir_ptr->at((size_t)di).dn_offset,
+                                                         D, F, dequant_copy, row_bytes_copy,
+                                                         packed, new_dn, read_err) ||
+                            packed.size() != len || new_dn != sf4_dn_off_const) {
+                            std::fprintf(stderr, "[InkCUDA] GGUF cold repack expert %d failed: %s\n",
+                                         di, read_err.c_str());
+                            return false;
+                        }
+                        std::memcpy(dst, packed.data(), len);
+                    } else {
+                        if (raw.size() != len) return false;
+                        std::memcpy(dst, raw.data(), len);
+                    }
+                    return true;
+                };
+
+            hybrid.cold_store = std::make_unique<ink2::InkColdStore>();
+            auto pin_alloc = [](size_t b) -> uint8_t* {
+                uint8_t* p = nullptr;
+                if (cudaHostAlloc(&p, b, cudaHostAllocDefault) == cudaSuccess) return p;
+                return nullptr;
+            };
+            auto pin_free = [](uint8_t* p) { if (p) cudaFreeHost(p); };
+            const size_t ring_bytes = 512ull << 20;  // fixed, bounded I/O working set; separate from the resident-expert RAM cap
+            if (!hybrid.cold_store->open(mf.path, std::move(cdescs), max_exp_b, ring_bytes, 4,
+                                         err, pin_alloc, pin_free, std::move(source_reader))) {
+                return false;
+            }
+            hybrid.ssd_only = true;
+            INK_CK(cudaHostAlloc(&hybrid.h_copyback_buf, (max_exp_b + 255ull) & ~255ull, cudaHostAllocDefault));
+            hybrid.h_copyback_bytes = (max_exp_b + 255ull) & ~255ull;
+            std::fprintf(stderr, "[InkCUDA] GGUF/HF bounded cold tier: %zu resident-RAM experts (%.2f GiB), %zu cold experts; ring=%.0f MiB\n",
+                         n_host_experts - n_ssd_experts, (double)uh / 1073741824.0,
+                         n_ssd_experts, (double)hybrid.cold_store->pool_bytes() / 1048576.0);
         }
 
         // Precompute exact destination offsets so we can upload/repack in parallel chunks!
