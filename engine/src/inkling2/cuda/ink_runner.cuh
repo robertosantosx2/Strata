@@ -246,7 +246,7 @@ struct InkCudaModel {
     uint8_t* d_sec4_peer = nullptr;
     uint8_t* h_sec4_pinned = nullptr;  // optional pinned overflow for 8/12/16 GB GPUs
     size_t trunk_bytes = 0, sec4_bytes = 0, sec4_peer_bytes = 0;
-    size_t n_vram_experts = 0, n_peer_experts = 0, n_host_experts = 0;
+    size_t n_vram_experts = 0, n_peer_experts = 0, n_host_experts = 0, n_cold_experts = 0;
 
     // Preprocessed per-layer F32 buffers (tiny: < 40 MB total)
     float* d_msg_queries[12] = {};      // [4, 2304] F32 for physical layers 6..17
@@ -1360,6 +1360,7 @@ struct InkCudaModel {
         const bool use_cold_tier = !is_strata_fmt;
         const size_t host_ram_cap = use_cold_tier ? safe_host_ram_cap(ram_experts_gb, ssd_experts) : static_cast<size_t>(-1);
         const bool force_cold = use_cold_tier && (ssd_experts || ram_experts_gb == 0.0);
+        n_cold_experts = 0;
         size_t stage_u[kMaxStages] = {};
         size_t stage_bud[kMaxStages] = {};
         const size_t user_vram_cap = (vram_experts_gb >= 0.0)
@@ -1565,7 +1566,7 @@ struct InkCudaModel {
         // The synthetic source span preserves the exact adapter conversion path (including exotic GGUF -> SF4).
         if (n_ssd_experts > 0) {
             const size_t virtual_stride = (max_exp_b + 4095ull) & ~4095ull;
-            if (virtual_stride == 0 || n_total > (int)(UINT64_MAX / virtual_stride)) {
+            if (virtual_stride == 0 || (uint64_t)n_total > UINT64_MAX / virtual_stride) {
                 err = "GGUF cold tier: invalid virtual source layout";
                 return false;
             }
@@ -1639,6 +1640,7 @@ struct InkCudaModel {
                 return false;
             }
             hybrid.ssd_only = true;
+            n_cold_experts = n_ssd_experts;
             INK_CK(cudaHostAlloc(&hybrid.h_copyback_buf, (max_exp_b + 255ull) & ~255ull, cudaHostAllocDefault));
             hybrid.h_copyback_bytes = (max_exp_b + 255ull) & ~255ull;
             std::fprintf(stderr, "[InkCUDA] GGUF/HF bounded cold tier: %zu resident-RAM experts (%.2f GiB), %zu cold experts; ring=%.0f MiB\n",
