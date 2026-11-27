@@ -307,6 +307,9 @@ public:
                 std::memset(base, 0, d.body_bytes);
                 std::memcpy(base, d.prefix.data(), d.prefix.size());
                 req = strata::core::StreamExpertReq::make_three_proj(key, layer, gen, slot, base, d.spans, d.body_bytes);
+            } else if (d.n_spans == 1) {
+                req.key = key; req.layer = layer; req.gen = gen; req.slot = slot; req.dst = base;
+                req.total_bytes = d.body_bytes; req.n_spans = 1; req.spans[0] = d.spans[0];
             } else {
                 req = strata::core::StreamExpertReq::make_contiguous_split(
                     key, layer, gen, slot, base, 0, aligned_off, read_len, dn_split, align);
@@ -358,6 +361,9 @@ public:
             if (where_.find(key) != where_.end()) return;
         }
         const auto& d = descs_[static_cast<size_t>(key)];
+        // Synthetic GGUF source reads reconstruct a complete expert per request; do not split them into
+        // speculative 512 KiB chunks. Demand reads remain bounded to one ring slot.
+        if (d.n_spans == 1) return;
         const size_t align = std::max<size_t>(4096u, sector_align_);
         const uint64_t aligned_off = d.file_off & ~(static_cast<uint64_t>(align) - 1u);
         const size_t head_pad = static_cast<size_t>(d.file_off - aligned_off);
