@@ -97,7 +97,7 @@ public:
         BackendStats st{};
         if (initialized_) {
             st.vram_experts_loaded = model_.n_vram_experts + model_.n_peer_experts;
-            st.ram_experts_loaded  = model_.n_host_experts;
+            st.ram_experts_loaded  = model_.n_host_experts - model_.n_cold_experts;
             st.total_experts       = model_.n_vram_experts + model_.n_peer_experts + model_.n_host_experts;
             size_t vf = 0, vt = 0;
             if (cudaMemGetInfo(&vf, &vt) == cudaSuccess) {
