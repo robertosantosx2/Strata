@@ -83,6 +83,8 @@ public:
               FreeFn free_fn = nullptr,
               ReaderFn reader_fn = nullptr) {
         close();
+        direct_ = false;
+        sector_align_ = 4096;
         if (max_expert_bytes == 0) {
             err = "InkColdStore: max_expert_bytes is 0";
             return false;
@@ -218,6 +220,8 @@ public:
 #else
         if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
 #endif
+        reader_fn_ = nullptr;
+        direct_ = false;
         open_ = false;
     }
 
