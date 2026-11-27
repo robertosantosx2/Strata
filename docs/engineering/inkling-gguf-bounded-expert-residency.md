@@ -20,25 +20,26 @@ The `.strata` loader already has a three-tier policy (VRAM, bounded RAM, SSD col
 
 ## Source layout and scheduler capability
 
-For each physical layer, `GgufAdapter::layers` records mapped pointers, shard-resolved tensor locations and per-expert strides for gate/up/down tensors. The adapter's `read_expert_body()` constructs a canonical contiguous `GGUF_RAW` body: 32-byte header, gate/up bytes, alignment padding, then down bytes.
+The GGUF adapter exposes a canonical read_expert_body() operation. It reconstructs each expert from its source tensors, writes the 32-byte GGUF_RAW header and preserves the payload bytes. The CUDA loader may then apply its existing GGUF-to-SF4 conversion for formats without a native GPU kernel.
 
-The important discovery is that `strata::core::StreamExpertReq` already supports three independent projection spans via `make_three_proj()`. This is sufficient for GGUF without rebuilding every expert into an intermediate vector:
+The first cold-tier implementation deliberately uses this adapter boundary rather than reading tensor spans directly:
 
-- Fused gate/up layout: span 0 reads the fused gate+up expert payload; span 1 is empty; span 2 reads down.
-- Separate gate/up layout: spans 0, 1 and 2 read gate, up and down independently.
-- Each span writes directly into its final offset in the bounded ring slot. The 32-byte `GgufExpertHeader` can be written to the slot when it is bound.
-- `file_idx` can identify the GGUF shard and `file_off` the byte offset relative to that shard's mapped data section. A reader callback can copy from the mapped shard base and zero-pad alignment at EOF. This also handles split GGUF models without assuming that the tensors share a shard.
+- The cold descriptor stores a synthetic expert key/offset and the final resident body size.
+- The source-reader callback calls InkModelFile::read_expert_body(); if need_sf4_repack is set, it runs the same repack_gguf_raw_body_to_sf4() conversion used by eager loading.
+- The callback writes the complete final expert directly into one bounded ring slot. It does not allocate a model-sized host arena or retain a per-expert copy.
+- The callback's temporary source and converted vectors are limited to one expert per active reader. The reader count is capped at four for this path.
+- Synthetic whole-expert requests are demand-only in this first patch; chunked speculative prefetch is intentionally skipped because splitting a conversion into arbitrary 512 KiB reads would repeat or corrupt the conversion. The existing .strata file-backed path retains its projection-level prefetch behavior.
 
-The existing `InkColdStore` currently opens one physical `.strata` file and discards `file_idx` in its read callback. It needs a source-reader mode that accepts a callback over (shard index, mapped-data offset, destination, length), while preserving the existing file-backed mode unchanged. The scheduler's per-projection readiness flags then allow gate/up and down reads to retain their current overlap semantics.
+The scheduler already supports three independent projection spans through StreamExpertReq::make_three_proj(). A later optimization can use that interface for native GGUF_RAW experts that need no repack, reading fused or separate gate/up and down directly from shard mappings. It is not required for correctness of the initial bounded-memory path.
 
 ## Proposed implementation
 
-1. **Separate placement from materialization.** Extend GGUF expert placement to classify each expert as VRAM, RAM, or cold using `safe_host_ram_cap()`. Track exact aligned byte totals for each tier. Experts beyond the RAM budget must not contribute to `uh` or the host arena allocation.
-2. **Generalize the cold-store reader.** Add a source-reader mode to `InkColdStore` (or a narrowly scoped GGUF wrapper) that consumes the existing three projection spans. Store shard index, source offsets, destination offsets, byte counts, and the 32-byte per-expert header in each descriptor. Bind and pin a ring slot before issuing reads; release it only after CPU evaluation or CUDA DMA has completed. Keep the current `.strata` direct-I/O reader behavior unchanged.
-3. **Build GGUF descriptors from the adapter.** Expose validated shard data bases and tensor offsets/strides from `GgufAdapter`. For fused and split gate/up layouts, generate the correct spans and header scales. Validate every span against its source shard's mapped data length before starting worker threads.
-4. **Integrate the CUDA hybrid path.** Host metadata must distinguish resident RAM bodies from cold-ring bodies. The decode CPU path and prefill ping-pong DMA path must acquire/release cold slots with the same lifetime guarantees as current SSD slots. Preserve the existing `InkExpertDev` layout and `GGUF_RAW` kernel dispatch.
-5. **Bound all supporting allocations.** Include ring slots, bounce buffers, and prefetch slots in the documented RAM budget. Do not interpret `--ram-experts-gb` as a soft cap.
-6. **Test incrementally.** Add host-only tests for tier accounting, zero-RAM/SSD-only policy, exact three-span reconstruction against `read_expert_body()` for fused and split gate/up, shard boundaries, slot pin/eviction, concurrent demand/prefetch, and hard budget assertions. Add CUDA build/runtime smoke coverage separately.
+1. **Bounded placement.** Classify each external-format expert as VRAM, resident RAM, or cold using safe_host_ram_cap(). Only resident RAM experts contribute to the host arena size. The cold ring is separately bounded and reported as fixed I/O working memory.
+2. **Source-backed cold store.** Extend InkColdStore with a reader callback mode while keeping the existing .strata direct-I/O mode unchanged. Whole-expert GGUF requests use a single scheduler span; the descriptor maps the logical expert ID to its directory entry.
+3. **Conversion parity.** Reuse InkModelFile::read_expert_body() and the existing GGUF-to-SF4 conversion path so cold and resident experts have identical internal bytes and format codes.
+4. **Hybrid integration.** Cold experts use InkHostExpertMeta::cold_ssd with a null resident body. The existing CPU demand path and CUDA prefill DMA path acquire and release the cold ring slots. Adaptive hot-tier duplication is disabled for external formats so it cannot exceed the requested RAM cap.
+5. **Bound supporting allocations.** Report resident arena bytes, cold-ring bytes, and the maximum per-reader conversion scratch. Keep the cold ring capped at 2 GiB (minimum 256 MiB when explicitly sizing it; 512 MiB default), with the existing minimum slot count.
+6. **Test incrementally.** Add host-only tests for tier accounting, zero-RAM/SSD-only policy, directory-index versus logical-expert-key mapping, callback failure propagation, ring pin/eviction, concurrent demand, and hard resident-arena budget assertions. Add CUDA build/runtime smoke coverage separately.
 
 ## Acceptance criteria
 
