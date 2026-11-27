@@ -1354,7 +1354,12 @@ struct InkCudaModel {
             eff_split = (float)std::max(0.50, std::min(0.625, ratio));
         }
         std::vector<uint8_t> target_tier(n_total, 2);
+        std::vector<uint8_t> in_cold(n_total, 0);
         size_t u0 = 0, u1 = 0, uh = 0, max_exp_b = 0;
+        size_t host_ram_used = 0, n_ssd_experts = 0;
+        const bool use_cold_tier = !is_strata_fmt;
+        const size_t host_ram_cap = use_cold_tier ? safe_host_ram_cap(ram_experts_gb, ssd_experts) : static_cast<size_t>(-1);
+        const bool force_cold = use_cold_tier && (ssd_experts || ram_experts_gb == 0.0);
         size_t stage_u[kMaxStages] = {};
         size_t stage_bud[kMaxStages] = {};
         const size_t user_vram_cap = (vram_experts_gb >= 0.0)
@@ -1390,7 +1395,9 @@ struct InkCudaModel {
                 } else {
                     // Preserve lossless native FMT_GGUF_RAW blocks in host RAM (zero SF4 quality loss & zero repack startup delay!)
                     const size_t hb = (eff_bytes[di] + 63ull) & ~63ull;
-                    target_tier[di] = 2; uh += hb; ++n_host_experts;
+                    target_tier[di] = 2; ++n_host_experts;
+                    if (use_cold_tier && (force_cold || host_ram_used + hb > host_ram_cap)) { in_cold[di] = 1; ++n_ssd_experts; }
+                    else { uh += hb; host_ram_used += hb; }
                     max_exp_b = std::max(max_exp_b, eff_bytes[di]);
                     if (s > 0) ++ls_peer_host_overflow;
                 }
@@ -1434,7 +1441,9 @@ struct InkCudaModel {
                 } else {
                     // Preserve lossless native FMT_GGUF_RAW blocks in host RAM (evaluated via strata::quant SIMD & GPU DP4A staging!)
                     const size_t hb = (eff_bytes[di] + 63ull) & ~63ull;
-                    target_tier[di] = 2; uh += hb; ++n_host_experts;
+                    target_tier[di] = 2; ++n_host_experts;
+                    if (use_cold_tier && (force_cold || host_ram_used + hb > host_ram_cap)) { in_cold[di] = 1; ++n_ssd_experts; }
+                    else { uh += hb; host_ram_used += hb; }
                     max_exp_b = std::max(max_exp_b, eff_bytes[di]);
                 }
             }
@@ -1453,7 +1462,9 @@ struct InkCudaModel {
                             if (target_tier[di] == 1) {
                                 u1 -= eff_bytes[di]; --n_peer_experts;
                                 const size_t hb = (eff_bytes[di] + 63ull) & ~63ull;
-                                target_tier[di] = 2; uh += hb; ++n_host_experts;
+                                target_tier[di] = 2; ++n_host_experts;
+                    if (use_cold_tier && (force_cold || host_ram_used + hb > host_ram_cap)) { in_cold[di] = 1; ++n_ssd_experts; }
+                    else { uh += hb; host_ram_used += hb; }
                                 max_exp_b = std::max(max_exp_b, eff_bytes[di]);
                             }
                         }
@@ -1466,7 +1477,7 @@ struct InkCudaModel {
         // every expert then has a host copy. Needs the RAM for the card's share on top of the host share (checked against what is available).
         bool tier_mode = false;
         std::vector<int> tier_key_of_di;
-        if (!ls_active && !ep2_active && n_host_experts > 0 && u0 > 0 && !ssd_experts && InkHybridEngine::tier_enabled_env()) {
+        if (!ls_active && !ep2_active && n_host_experts > 0 && n_ssd_experts == 0 && u0 > 0 && !ssd_experts && InkHybridEngine::tier_enabled_env()) {
             size_t add = 0;
             for (int di = 0; di < n_total; ++di) if (target_tier[di] == 0) add += (eff_bytes[di] + 63ull) & ~63ull;
             const uint64_t avail_ram = ink_ram_available_bytes();
