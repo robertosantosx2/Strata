@@ -1465,9 +1465,15 @@ struct InkCudaModel {
                             if (target_tier[di] == 1) {
                                 u1 -= eff_bytes[di]; --n_peer_experts;
                                 const size_t hb = (eff_bytes[di] + 63ull) & ~63ull;
-                                target_tier[di] = 2; ++n_host_experts;
-                    if (use_cold_tier && (force_cold || host_ram_used + hb > host_ram_cap)) { in_cold[di] = 1; ++n_ssd_experts; }
-                    else { uh += hb; host_ram_used += hb; }
+                                target_tier[di] = 2;
+                                ++n_host_experts;
+                                if (use_cold_tier && (force_cold || host_ram_used + hb > host_ram_cap)) {
+                                    in_cold[di] = 1;
+                                    ++n_ssd_experts;
+                                } else {
+                                    uh += hb;
+                                    host_ram_used += hb;
+                                }
                                 max_exp_b = std::max(max_exp_b, eff_bytes[di]);
                             }
                         }
