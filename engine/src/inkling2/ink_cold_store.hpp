@@ -304,6 +304,7 @@ public:
             const size_t dn_split = (d.dn_off > 0 && d.dn_off < d.body_bytes) ? (head_pad + d.dn_off) : 0;
             strata::core::StreamExpertReq req;
             if (d.n_spans == 3) {
+                std::memset(base, 0, d.body_bytes);
                 std::memcpy(base, d.prefix.data(), d.prefix.size());
                 req = strata::core::StreamExpertReq::make_three_proj(key, layer, gen, slot, base, d.spans, d.body_bytes);
             } else {
@@ -475,6 +476,7 @@ private:
         out_slot = slot;
         out_dst  = pool_ + static_cast<size_t>(slot) * slot_stride_;
         if (descs_[static_cast<size_t>(key)].n_spans == 3) {
+            std::memset(out_dst, 0, descs_[static_cast<size_t>(key)].body_bytes);
             std::memcpy(out_dst, descs_[static_cast<size_t>(key)].prefix.data(), descs_[static_cast<size_t>(key)].prefix.size());
         }
         return true;
