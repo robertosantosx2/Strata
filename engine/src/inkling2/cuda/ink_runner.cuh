@@ -1477,7 +1477,7 @@ struct InkCudaModel {
         // every expert then has a host copy. Needs the RAM for the card's share on top of the host share (checked against what is available).
         bool tier_mode = false;
         std::vector<int> tier_key_of_di;
-        if (!ls_active && !ep2_active && n_host_experts > 0 && n_ssd_experts == 0 && u0 > 0 && !ssd_experts && InkHybridEngine::tier_enabled_env()) {
+        if (!use_cold_tier && !ls_active && !ep2_active && n_host_experts > 0 && n_ssd_experts == 0 && u0 > 0 && !ssd_experts && InkHybridEngine::tier_enabled_env()) {
             size_t add = 0;
             for (int di = 0; di < n_total; ++di) if (target_tier[di] == 0) add += (eff_bytes[di] + 63ull) & ~63ull;
             const uint64_t avail_ram = ink_ram_available_bytes();
