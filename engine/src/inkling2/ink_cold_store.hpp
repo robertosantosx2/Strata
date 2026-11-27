@@ -14,6 +14,7 @@
 #include "strata/platform/direct_file.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -49,6 +50,11 @@ struct InkColdExpertDesc {
     uint32_t dn_off     = 0;
     uint8_t  gu_code    = 0;
     uint8_t  dn_code    = 0;
+    // Optional source-backed GGUF body: up to three shard-relative tensor spans.
+    std::array<strata::core::ExpertProjSpan, 3> spans{};
+    int n_spans = 0;
+    // Canonical GGUF_RAW header, written into each ring slot before projection reads.
+    std::array<uint8_t, 32> prefix{};
 };
 
 /// Bounded LRU + 2-Priority Late-Binding Chunked O_DIRECT / FILE_FLAG_NO_BUFFERING ColdStore
@@ -57,6 +63,7 @@ class InkColdStore {
 public:
     using AllocFn = std::function<uint8_t*(size_t bytes)>;
     using FreeFn  = std::function<void(uint8_t* ptr)>;
+    using ReaderFn = std::function<bool(int file_idx, uint64_t file_off, uint8_t* dst, size_t len)>;
 
     InkColdStore() = default;
     ~InkColdStore() { close(); }
@@ -73,7 +80,8 @@ public:
               int n_readers,
               std::string& err,
               AllocFn alloc_fn = nullptr,
-              FreeFn free_fn = nullptr) {
+              FreeFn free_fn = nullptr,
+              ReaderFn reader_fn = nullptr) {
         close();
         if (max_expert_bytes == 0) {
             err = "InkColdStore: max_expert_bytes is 0";
@@ -82,7 +90,9 @@ public:
         descs_ = std::move(descs);
         alloc_fn_ = std::move(alloc_fn);
         free_fn_  = std::move(free_fn);
+        reader_fn_ = std::move(reader_fn);
 
+        if (!reader_fn_) {
 #ifdef _WIN32
         DWORD flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_NO_BUFFERING;
         h_ = CreateFileA(strata_path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
@@ -128,6 +138,7 @@ public:
 #endif
         }
 #endif
+        }
         // Each slot stores one expert aligned up to `sector_align_` plus one trailing sector for unaligned file offsets!
         const size_t align = std::max<size_t>(4096u, sector_align_);
         slot_stride_ = ((max_expert_bytes + align * 2u - 1u) / align) * align;
@@ -159,8 +170,8 @@ public:
         const int nr = std::max(1, std::min(8, n_readers > 0 ? n_readers : 4));
         sched_.start(
             nr, n_slots_,
-            [this](int /*file_idx*/, uint64_t off, uint8_t* dst, size_t len) -> bool {
-                return read_raw(off, dst, len);
+            [this](int file_idx, uint64_t off, uint8_t* dst, size_t len) -> bool {
+                return read_raw(file_idx, off, dst, len);
             },
             [this](const strata::core::StreamExpertReq& req, int& out_slot, uint8_t*& out_dst) -> bool {
                 return bind_prefetch_slot(req.key, out_slot, out_dst);
@@ -291,8 +302,14 @@ public:
         if (need_io) {
             uint8_t* base = pool_ + static_cast<size_t>(slot) * slot_stride_;
             const size_t dn_split = (d.dn_off > 0 && d.dn_off < d.body_bytes) ? (head_pad + d.dn_off) : 0;
-            auto req = strata::core::StreamExpertReq::make_contiguous_split(
-                key, layer, gen, slot, base, 0, aligned_off, read_len, dn_split, align);
+            strata::core::StreamExpertReq req;
+            if (d.n_spans == 3) {
+                std::memcpy(base, d.prefix.data(), d.prefix.size());
+                req = strata::core::StreamExpertReq::make_three_proj(key, layer, gen, slot, base, d.spans, d.body_bytes);
+            } else {
+                req = strata::core::StreamExpertReq::make_contiguous_split(
+                    key, layer, gen, slot, base, 0, aligned_off, read_len, dn_split, align);
+            }
             sched_.enqueue_demand(std::move(req));
         }
         return pool_ + static_cast<size_t>(slot) * slot_stride_ + head_pad;
@@ -345,8 +362,13 @@ public:
         const size_t head_pad = static_cast<size_t>(d.file_off - aligned_off);
         const size_t read_len = ((head_pad + d.body_bytes + align - 1u) / align) * align;
         const size_t dn_split = (d.dn_off > 0 && d.dn_off < d.body_bytes) ? (head_pad + d.dn_off) : 0;
-        auto req = strata::core::StreamExpertReq::make_contiguous_split(
-            key, layer, gen, -1, nullptr, 0, aligned_off, read_len, dn_split, align);
+        strata::core::StreamExpertReq req;
+        if (d.n_spans == 3) {
+            req = strata::core::StreamExpertReq::make_three_proj(key, layer, gen, -1, nullptr, d.spans, d.body_bytes);
+        } else {
+            req = strata::core::StreamExpertReq::make_contiguous_split(
+                key, layer, gen, -1, nullptr, 0, aligned_off, read_len, dn_split, align);
+        }
         sched_.enqueue_prefetch(std::move(req));
     }
 
@@ -452,10 +474,14 @@ private:
         where_[key] = slot;
         out_slot = slot;
         out_dst  = pool_ + static_cast<size_t>(slot) * slot_stride_;
+        if (descs_[static_cast<size_t>(key)].n_spans == 3) {
+            std::memcpy(out_dst, descs_[static_cast<size_t>(key)].prefix.data(), descs_[static_cast<size_t>(key)].prefix.size());
+        }
         return true;
     }
 
-    bool read_raw(uint64_t off, uint8_t* dst, size_t len) const {
+    bool read_raw(int file_idx, uint64_t off, uint8_t* dst, size_t len) const {
+        if (reader_fn_) return reader_fn_(file_idx, off, dst, len);
         size_t got = 0;
 #ifdef _WIN32
         HANDLE ev = CreateEventA(nullptr, TRUE, FALSE, nullptr);
@@ -515,6 +541,7 @@ private:
     bool custom_alloc_ = false;
     AllocFn alloc_fn_;
     FreeFn  free_fn_;
+    ReaderFn reader_fn_;
 
 #ifdef _WIN32
     HANDLE h_ = INVALID_HANDLE_VALUE;
