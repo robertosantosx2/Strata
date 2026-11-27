@@ -243,7 +243,11 @@ public:
             total_exp_bytes += e.body_bytes;
             max_exp_bytes = std::max<size_t>(max_exp_bytes, e.body_bytes);
         }
-        const bool need_cold_ssd = opts.ssd_experts || (ram_cap_bytes < total_exp_bytes);
+        // ColdStore file offsets are defined by the native .strata Section 4 layout.
+        // GGUF and safetensors synthesize expert bodies through their adapters, so their
+        // non-pinned experts must use read_expert_body() rather than raw file-offset I/O.
+        const bool native_strata = model.is_native_strata();
+        const bool need_cold_ssd = native_strata && (opts.ssd_experts || (ram_cap_bytes < total_exp_bytes));
         size_t preload_cap = ram_cap_bytes;
         size_t cold_ring_bytes = 0;
         if (need_cold_ssd) {
@@ -257,6 +261,9 @@ public:
                 cold_ring_bytes = std::min<size_t>(512ULL << 20, std::max<size_t>(128ULL << 20, ram_cap_bytes / 4));
                 preload_cap = (ram_cap_bytes > cold_ring_bytes) ? (ram_cap_bytes - cold_ring_bytes) : 0;
             }
+        } else if (!native_strata && opts.ssd_experts && opts.ram_experts_gb <= 0.0) {
+            // Preserve explicit SSD-only intent without applying .strata offsets to another container.
+            preload_cap = 0;
         }
         size_t loaded_bytes = 0;
         size_t n_loaded = 0;
@@ -267,7 +274,7 @@ public:
             loaded_bytes += dir[idx].body_bytes;
             ++n_loaded;
         }
-        if (n_loaded < dir.size() && max_exp_bytes > 0) {
+        if (native_strata && n_loaded < dir.size() && max_exp_bytes > 0) {
             std::vector<InkColdExpertDesc> cdescs(dir.size());
             const uint64_t sec4_off = model.rd.header().sections[4].file_offset;
             for (size_t i = 0; i < dir.size(); ++i) {

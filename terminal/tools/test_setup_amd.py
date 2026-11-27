@@ -791,7 +791,10 @@ class RocmSplitLayout(unittest.TestCase):
             f.write_text(f"#define ROCM_VERSION_MAJOR {version[0]}\n#define ROCM_VERSION_MINOR {version[1]}\n"
                          if rel.endswith("rocm_version.h") else "")
         if hipcc:
-            (p / "bin/hipcc").chmod(0o755)              # shutil.which only answers for an executable file
+            (p / "bin/hipcc").chmod(0o755)              # rocm_root checks this canonical prefix path
+            if setup.WIN:
+                # Windows shutil.which searches PATHEXT; keep the POSIX-shaped file above for prefix checks.
+                (p / "bin/hipcc.exe").write_text("")
         return p
 
     def env(self, **kw):

@@ -636,6 +636,28 @@ if(STRATA_BUILD_TESTS)
     endforeach()
   endif()
 
+  # PR #1: exercise real file I/O through the native .strata ColdStore descriptor path.
+  # The fixture uses an absolute, deliberately unaligned extent; this covers sector alignment,
+  # head padding and byte-for-byte reconstruction without requiring a model download.
+  add_executable(ink_cold_store_native_file_test tests/core/ink_cold_store_native_file_test.cpp)
+  target_include_directories(ink_cold_store_native_file_test PRIVATE include src/inkling2)
+  target_link_libraries(ink_cold_store_native_file_test PRIVATE Threads::Threads)
+  add_test(NAME ink_cold_store_native_file_test COMMAND ink_cold_store_native_file_test)
+
+  # End-to-end native .strata v1.0: parse header/manifest/directory, derive the Section 4
+  # absolute expert offset, then stream and compare the body through InkColdStore.
+  find_library(STRATA_ZSTD_LIBRARY NAMES zstd)
+  if(STRATA_ZSTD_LIBRARY)
+    add_executable(strata_native_artifact_coldstore_test
+      tests/core/strata_native_artifact_coldstore_test.cpp
+      src/artifact/strata_reader.cpp)
+    target_include_directories(strata_native_artifact_coldstore_test PRIVATE include src/inkling2)
+    target_link_libraries(strata_native_artifact_coldstore_test PRIVATE Threads::Threads ${STRATA_ZSTD_LIBRARY})
+    add_test(NAME strata_native_artifact_coldstore_test COMMAND strata_native_artifact_coldstore_test)
+  else()
+    message(STATUS "Skipping strata_native_artifact_coldstore_test: zstd library not found")
+  endif()
+
   if(UNIX AND NOT APPLE)
     add_executable(direct_file_async_test tests/platform/direct_file_async.cpp src/platform/direct_file.cpp)
     target_include_directories(direct_file_async_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)

@@ -1128,6 +1128,28 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < logits.size() * sizeof(float); ++i) { h ^= p[i]; h *= 1099511628211ull; }
         fprintf(stderr, "[logits-hash] step %d %016llx\n", step, static_cast<unsigned long long>(h));
     };
+    // INK_LOGITS_DIAG=1: inspect every full-vocabulary FP32 row before sampling.
+    // Fail closed on NaN/Inf so a token ID cannot mask invalid logits.
+    const bool diag_logits = std::getenv("INK_LOGITS_DIAG") && std::getenv("INK_LOGITS_DIAG")[0] == '1';
+    auto logits_diag = [&](int step) -> bool {
+        if (!diag_logits) return true;
+        size_t finite = 0, nan = 0, inf = 0;
+        int first_bad = -1;
+        float lo = INFINITY, hi = -INFINITY;
+        for (int i = 0; i < V; ++i) {
+            const float x = logits[static_cast<size_t>(i)];
+            if (std::isnan(x)) { ++nan; if (first_bad < 0) first_bad = i; }
+            else if (std::isinf(x)) { ++inf; if (first_bad < 0) first_bad = i; }
+            else { ++finite; lo = std::min(lo, x); hi = std::max(hi, x); }
+        }
+        fprintf(stderr, "[logits-diag] step=%d vocab=%d finite=%zu nan=%zu inf=%zu min=%.9g max=%.9g first_bad=%d\n",
+                step, V, finite, nan, inf, finite ? lo : 0.0f, finite ? hi : 0.0f, first_bad);
+        return nan == 0 && inf == 0 && finite == static_cast<size_t>(V);
+    };
+    if (!logits_diag(-1)) {
+        fprintf(stderr, "[logits-diag] refusing to sample non-finite prefill logits\n");
+        return 1;
+    }
     logits_hash(-1);
     for (int g = 0; g < bench_gen; ++g) {
         int32_t tok = sample_logits(logits.data(), V, so, hist, rng);
@@ -1139,6 +1161,10 @@ int main(int argc, char** argv) {
         batch.push(0, pos++, tok, true);
         if (!backend->forward_batch(batch, logits.data(), nullptr, err)) {
             fprintf(stderr, "decode: %s\n", err.c_str());
+            return 1;
+        }
+        if (!logits_diag(g)) {
+            fprintf(stderr, "[logits-diag] refusing to continue after non-finite decode logits at step %d\n", g);
             return 1;
         }
         logits_hash(g);
