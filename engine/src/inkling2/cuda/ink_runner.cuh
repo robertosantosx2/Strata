@@ -1634,9 +1634,7 @@ struct InkCudaModel {
                 return nullptr;
             };
             auto pin_free = [](uint8_t* p) { if (p) cudaFreeHost(p); };
-            const size_t ring_bytes = (ram_experts_gb > 0.0)
-                ? std::min<size_t>(2ull << 30, std::max<size_t>(256ull << 20, host_ram_cap))
-                : (512ull << 20);  // bounded pinned I/O ring, separate from resident expert arena
+            const size_t ring_bytes = 512ull << 20;  // fixed bounded pinned I/O working set, separate from resident expert arena
             if (!hybrid.cold_store->open(mf.path, std::move(cdescs), max_exp_b, ring_bytes, 4,
                                          err, pin_alloc, pin_free, std::move(source_reader))) {
                 return false;
