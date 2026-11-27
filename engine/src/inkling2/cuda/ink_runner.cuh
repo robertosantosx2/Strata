@@ -1655,6 +1655,7 @@ struct InkCudaModel {
                     cs[s] += eff_bytes[di];
                 } else if (target_tier[di] == 0) { dst_off[di] = c0; c0 += eff_bytes[di]; }
                 else if (target_tier[di] == 1)   { dst_off[di] = c1; c1 += eff_bytes[di]; }
+                else if (in_cold[di])             { dst_off[di] = 0; }
                 else                             { dst_off[di] = ch; ch += (eff_bytes[di] + 63ull) & ~63ull; }
             }
         }
@@ -1674,13 +1675,17 @@ struct InkCudaModel {
             bool any_repack = false;
             for (int r = 0; r < E; ++r) {
                 const int di = il * E + r;
+                const auto& e = dir[(size_t)di];
                 if (need_sf4_repack[di]) any_repack = true;
+                layer_dn_off[r] = need_sf4_repack[di] ? (uint32_t)sf4_dn_off_const : e.dn_offset;
+                layer_gu_code[r] = need_sf4_repack[di] ? FMT_SF4 : e.gu_code_id;
+                layer_dn_code[r] = need_sf4_repack[di] ? FMT_SF4 : e.dn_code_id;
             }
             if (any_repack) {
                 std::vector<std::vector<uint8_t>> raw_bodies(E);
                 for (int r = 0; r < E; ++r) {
                     const int di = il * E + r;
-                    if (!mf.read_expert_body(di, raw_bodies[r], err)) return false;
+                    if (!in_cold[di] && !mf.read_expert_body(di, raw_bodies[r], err)) return false;
                 }
                 std::atomic<int> next_r{0};
                 std::atomic<bool> par_ok{true};
@@ -1696,6 +1701,7 @@ struct InkCudaModel {
                             if (r >= E || !par_ok.load(std::memory_order_relaxed)) break;
                             const int di = il * E + r;
                             const auto& e = dir[di];
+                            if (in_cold[di]) continue;
                             if (need_sf4_repack[di]) {
                                 uint32_t new_dn = 0;
                                 std::string lerr;
@@ -1724,11 +1730,8 @@ struct InkCudaModel {
             } else {
                 for (int r = 0; r < E; ++r) {
                     const int di = il * E + r;
-                    const auto& e = dir[di];
+                    if (in_cold[di]) continue;
                     if (!mf.read_expert_body(di, layer_bodies[r], err)) return false;
-                    layer_dn_off[r] = e.dn_offset;
-                    layer_gu_code[r] = e.gu_code_id;
-                    layer_dn_code[r] = e.dn_code_id;
                 }
             }
 
@@ -1773,19 +1776,30 @@ struct InkCudaModel {
                     layer_has_peer[il] = true;
                     mark_info(moe_info_peer[il], layer_gu_code[r], layer_dn_code[r]);
                 } else {
-                    uint8_t* hdst = h_arena_base + dst_off[di];
-                    std::memcpy(hdst, body.data(), body.size());
-                    hybrid.host_meta[key].body       = hdst;
-                    hybrid.host_meta[key].body_bytes = (uint32_t)body.size();
-                    hybrid.host_meta[key].dn_off     = layer_dn_off[r];
-                    hybrid.host_meta[key].gu_code    = layer_gu_code[r];
-                    hybrid.host_meta[key].dn_code    = layer_dn_code[r];
-                    hybrid.orig_host_off[key]        = dst_off[di];
-                    d0.body_off = dst_off[di]; d0.tier = 2;
-                    d1.body_off = 0;           d1.tier = 3;
+                    if (in_cold[di]) {
+                        hybrid.host_meta[key].body       = nullptr;
+                        hybrid.host_meta[key].body_bytes = (uint32_t)eff_bytes[di];
+                        hybrid.host_meta[key].dn_off     = layer_dn_off[r];
+                        hybrid.host_meta[key].gu_code    = layer_gu_code[r];
+                        hybrid.host_meta[key].dn_code    = layer_dn_code[r];
+                        hybrid.host_meta[key].cold_ssd   = true;
+                        d0.body_off = 0; d0.tier = 2;
+                        d1.body_off = 0; d1.tier = 3;
+                    } else {
+                        uint8_t* hdst = h_arena_base + dst_off[di];
+                        std::memcpy(hdst, body.data(), body.size());
+                        hybrid.host_meta[key].body       = hdst;
+                        hybrid.host_meta[key].body_bytes = (uint32_t)body.size();
+                        hybrid.host_meta[key].dn_off     = layer_dn_off[r];
+                        hybrid.host_meta[key].gu_code    = layer_gu_code[r];
+                        hybrid.host_meta[key].dn_code    = layer_dn_code[r];
+                        hybrid.orig_host_off[key]        = dst_off[di];
+                        d0.body_off = dst_off[di]; d0.tier = 2;
+                        d1.body_off = 0;           d1.tier = 3;
+                    }
                     layer_has_host[il] = true;
                     mark_info(moe_info[il], layer_gu_code[r], layer_dn_code[r]);
-                    if (tier_mode) {
+                    if (tier_mode && !in_cold[di]) {
                         // starts in a slot of the hot tier: bytes into the slot, table entry on the card (the host copy stays: it is what a swap demotes to)
                         if (uint8_t* sp = hybrid.tier_slot_ptr(key)) {
                             INK_CK(cudaMemcpy(sp, body.data(), body.size(), cudaMemcpyHostToDevice));
