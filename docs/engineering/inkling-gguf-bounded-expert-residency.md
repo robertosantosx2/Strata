@@ -18,19 +18,27 @@ The `.strata` loader already has a three-tier policy (VRAM, bounded RAM, SSD col
 - Keep the existing host CPU execution and GPU prefill staging contracts intact.
 - Fail clearly if a model/layout cannot be streamed safely; never silently exceed the configured cap.
 
-## Source layout
+## Source layout and scheduler capability
 
-For each physical layer, `GgufAdapter::layers` records mapped pointers and per-expert strides for gate/up/down tensors. `read_expert_body()` constructs the canonical contiguous `GGUF_RAW` body on demand: 32-byte header, gate/up bytes, alignment padding, then down bytes. This is the correct byte-preserving primitive for a cold-reader callback.
+For each physical layer, `GgufAdapter::layers` records mapped pointers, shard-resolved tensor locations and per-expert strides for gate/up/down tensors. The adapter's `read_expert_body()` constructs a canonical contiguous `GGUF_RAW` body: 32-byte header, gate/up bytes, alignment padding, then down bytes.
 
-The existing `InkColdStore` assumes each expert is a contiguous byte range in one file. Its `.strata` descriptor and direct-I/O reader therefore cannot be pointed at a GGUF tensor offset. A GGUF cold tier needs a reader abstraction that reconstructs one expert into a bounded ring slot from its original tensor slices.
+The important discovery is that `strata::core::StreamExpertReq` already supports three independent projection spans via `make_three_proj()`. This is sufficient for GGUF without rebuilding every expert into an intermediate vector:
+
+- Fused gate/up layout: span 0 reads the fused gate+up expert payload; span 1 is empty; span 2 reads down.
+- Separate gate/up layout: spans 0, 1 and 2 read gate, up and down independently.
+- Each span writes directly into its final offset in the bounded ring slot. The 32-byte `GgufExpertHeader` can be written to the slot when it is bound.
+- `file_idx` can identify the GGUF shard and `file_off` the byte offset relative to that shard's mapped data section. A reader callback can copy from the mapped shard base and zero-pad alignment at EOF. This also handles split GGUF models without assuming that the tensors share a shard.
+
+The existing `InkColdStore` currently opens one physical `.strata` file and discards `file_idx` in its read callback. It needs a source-reader mode that accepts a callback over (shard index, mapped-data offset, destination, length), while preserving the existing file-backed mode unchanged. The scheduler's per-projection readiness flags then allow gate/up and down reads to retain their current overlap semantics.
 
 ## Proposed implementation
 
 1. **Separate placement from materialization.** Extend GGUF expert placement to classify each expert as VRAM, RAM, or cold using `safe_host_ram_cap()`. Track exact aligned byte totals for each tier. Experts beyond the RAM budget must not contribute to `uh` or the host arena allocation.
-2. **Add a source-backed cold reader.** Add a bounded cold ring whose reader callback receives an expert key and reconstructs that expert into a ring slot through the GGUF adapter. Use the existing `read_expert_body()` semantics initially, but avoid retaining a vector per expert or a whole-model staging arena. The ring must pin slots while DMA/CPU execution is in flight and must participate in existing demand/prefetch scheduling.
-3. **Integrate the CUDA hybrid path.** Host metadata must distinguish resident RAM bodies from cold-ring bodies. The decode CPU path and prefill ping-pong DMA path must acquire/release cold slots with the same lifetime guarantees as current SSD slots. Preserve the existing `InkExpertDev` layout and `GGUF_RAW` kernel dispatch.
-4. **Bound all supporting allocations.** Include ring slots, bounce buffers, and prefetch slots in the documented RAM budget. Do not interpret `--ram-experts-gb` as a soft cap.
-5. **Test incrementally.** Add host-only tests for tier accounting, zero-RAM/SSD-only policy, exact body reconstruction for fused and split gate/up, shard boundaries, slot pin/eviction, concurrent demand/prefetch, and hard budget assertions. Add CUDA build/runtime smoke coverage separately.
+2. **Generalize the cold-store reader.** Add a source-reader mode to `InkColdStore` (or a narrowly scoped GGUF wrapper) that consumes the existing three projection spans. Store shard index, source offsets, destination offsets, byte counts, and the 32-byte per-expert header in each descriptor. Bind and pin a ring slot before issuing reads; release it only after CPU evaluation or CUDA DMA has completed. Keep the current `.strata` direct-I/O reader behavior unchanged.
+3. **Build GGUF descriptors from the adapter.** Expose validated shard data bases and tensor offsets/strides from `GgufAdapter`. For fused and split gate/up layouts, generate the correct spans and header scales. Validate every span against its source shard's mapped data length before starting worker threads.
+4. **Integrate the CUDA hybrid path.** Host metadata must distinguish resident RAM bodies from cold-ring bodies. The decode CPU path and prefill ping-pong DMA path must acquire/release cold slots with the same lifetime guarantees as current SSD slots. Preserve the existing `InkExpertDev` layout and `GGUF_RAW` kernel dispatch.
+5. **Bound all supporting allocations.** Include ring slots, bounce buffers, and prefetch slots in the documented RAM budget. Do not interpret `--ram-experts-gb` as a soft cap.
+6. **Test incrementally.** Add host-only tests for tier accounting, zero-RAM/SSD-only policy, exact three-span reconstruction against `read_expert_body()` for fused and split gate/up, shard boundaries, slot pin/eviction, concurrent demand/prefetch, and hard budget assertions. Add CUDA build/runtime smoke coverage separately.
 
 ## Acceptance criteria
 
