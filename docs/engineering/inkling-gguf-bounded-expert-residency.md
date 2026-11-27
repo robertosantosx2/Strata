@@ -38,7 +38,7 @@ The scheduler already supports three independent projection spans through Stream
 2. **Source-backed cold store.** Extend InkColdStore with a reader callback mode while keeping the existing .strata direct-I/O mode unchanged. Whole-expert GGUF requests use a single scheduler span; the descriptor maps the logical expert ID to its directory entry.
 3. **Conversion parity.** Reuse InkModelFile::read_expert_body() and the existing GGUF-to-SF4 conversion path so cold and resident experts have identical internal bytes and format codes.
 4. **Hybrid integration.** Cold experts use InkHostExpertMeta::cold_ssd with a null resident body. The existing CPU demand path and CUDA prefill DMA path acquire and release the cold ring slots. Adaptive hot-tier duplication is disabled for external formats so it cannot exceed the requested RAM cap.
-5. **Bound supporting allocations.** Report resident arena bytes, cold-ring bytes, and the maximum per-reader conversion scratch. Keep the cold ring capped at 2 GiB (minimum 256 MiB when explicitly sizing it; 512 MiB default), with the existing minimum slot count.
+5. **Bound supporting allocations.** Report resident arena bytes, cold-ring bytes, and the maximum per-reader conversion scratch. The first CUDA implementation uses a fixed 512 MiB pinned cold ring plus at most four per-reader expert conversion temporaries; both are bounded independently of the model's total expert bytes.
 6. **Test incrementally.** Add host-only tests for tier accounting, zero-RAM/SSD-only policy, directory-index versus logical-expert-key mapping, callback failure propagation, ring pin/eviction, concurrent demand, and hard resident-arena budget assertions. Add CUDA build/runtime smoke coverage separately.
 
 ## Acceptance criteria
