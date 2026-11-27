@@ -1142,12 +1142,12 @@ int main(int argc, char** argv) {
             else if (std::isinf(x)) { ++inf; if (first_bad < 0) first_bad = i; }
             else { ++finite; lo = std::min(lo, x); hi = std::max(hi, x); }
         }
-        fprintf(stderr, "[logits-diag] step=%d vocab=%d finite=%zu nan=%zu inf=%zu min=%.9g max=%.9g first_bad=%d\\n",
+        fprintf(stderr, "[logits-diag] step=%d vocab=%d finite=%zu nan=%zu inf=%zu min=%.9g max=%.9g first_bad=%d\n",
                 step, V, finite, nan, inf, finite ? lo : 0.0f, finite ? hi : 0.0f, first_bad);
         return nan == 0 && inf == 0 && finite == static_cast<size_t>(V);
     };
     if (!logits_diag(-1)) {
-        fprintf(stderr, "[logits-diag] refusing to sample non-finite prefill logits\\n");
+        fprintf(stderr, "[logits-diag] refusing to sample non-finite prefill logits\n");
         return 1;
     }
     logits_hash(-1);
@@ -1164,7 +1164,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (!logits_diag(g)) {
-            fprintf(stderr, "[logits-diag] refusing to continue after non-finite decode logits at step %d\\n", g);
+            fprintf(stderr, "[logits-diag] refusing to continue after non-finite decode logits at step %d\n", g);
             return 1;
         }
         logits_hash(g);
