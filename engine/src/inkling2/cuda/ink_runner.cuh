@@ -1572,7 +1572,8 @@ struct InkCudaModel {
             std::vector<ink2::InkColdExpertDesc> cdescs((size_t)n_total);
             for (int di = 0; di < n_total; ++di) {
                 if (!in_cold[di]) continue;
-                auto& d = cdescs[(size_t)di];
+                const int key = (di / man.c.n_experts) * man.c.n_experts + dir[(size_t)di].expert_id;
+                auto& d = cdescs[(size_t)key];
                 d.file_off = (uint64_t)di * virtual_stride;
                 d.body_bytes = (uint32_t)eff_bytes[(size_t)di];
                 d.dn_off = need_sf4_repack[(size_t)di] ? (uint32_t)sf4_dn_off_const : dir[(size_t)di].dn_offset;
@@ -1630,7 +1631,9 @@ struct InkCudaModel {
                 return nullptr;
             };
             auto pin_free = [](uint8_t* p) { if (p) cudaFreeHost(p); };
-            const size_t ring_bytes = 512ull << 20;  // fixed, bounded I/O working set; separate from the resident-expert RAM cap
+            const size_t ring_bytes = (ram_experts_gb > 0.0)
+                ? std::min<size_t>(2ull << 30, std::max<size_t>(256ull << 20, host_ram_cap))
+                : (512ull << 20);  // bounded pinned I/O ring, separate from resident expert arena
             if (!hybrid.cold_store->open(mf.path, std::move(cdescs), max_exp_b, ring_bytes, 4,
                                          err, pin_alloc, pin_free, std::move(source_reader))) {
                 return false;
