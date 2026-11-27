@@ -1360,7 +1360,10 @@ struct InkCudaModel {
         size_t u0 = 0, u1 = 0, uh = 0, max_exp_b = 0;
         size_t host_ram_used = 0, n_ssd_experts = 0;
         const bool use_cold_tier = !is_strata_fmt;
-        const size_t host_ram_cap = use_cold_tier ? safe_host_ram_cap(ram_experts_gb, ssd_experts) : static_cast<size_t>(-1);
+        const size_t measured_host_ram_cap = use_cold_tier ? safe_host_ram_cap(ram_experts_gb, ssd_experts) : static_cast<size_t>(-1);
+        // If MemAvailable cannot be read, never interpret that as unlimited host RAM for an external model.
+        const size_t host_ram_cap = use_cold_tier && measured_host_ram_cap == static_cast<size_t>(-1)
+            ? 0u : measured_host_ram_cap;
         const bool force_cold = use_cold_tier && (ssd_experts || ram_experts_gb == 0.0);
         n_cold_experts = 0;
         size_t stage_u[kMaxStages] = {};
