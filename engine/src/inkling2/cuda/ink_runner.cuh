@@ -306,6 +306,7 @@ struct InkCudaModel {
               size_t extra_reserve_bytes = 0, double vram_experts_gb = -1.0,
               double ram_experts_gb = -1.0, bool ssd_experts = false, int cpu_threads = 0) {
         path = strata_path;
+        n_cold_experts = 0;
         primary_gpu = gpu_id;
         INK_CK(cudaSetDevice(primary_gpu));
         {
@@ -852,6 +853,7 @@ struct InkCudaModel {
         int cpu_threads = 0) {
         // Fast zero-overhead path for single-GPU .strata v1.1!
         // The file's real kind decides, not the manifest's format string: a GGUF / safetensors file must never reach load() (the .strata reader).
+        n_cold_experts = 0;
         const bool is_strata_fmt = mf.is_native_strata();
         const bool single_gpu_req = (gpu1 < 0) && (all_gpus.size() <= 1) && layer_split_spec.empty();
         if (is_strata_fmt && single_gpu_req) {
